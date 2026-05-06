@@ -6,7 +6,7 @@ import cv2
 
 device = torch.device("cpu")
 batch = 8
-epochs = 100
+epochs = 50
 imgsz = 1280
 
 if(torch.cuda.is_available()):
