@@ -1,7 +1,24 @@
 from ultralytics import YOLO
 import time
 from collections import Counter
+import torch
 import cv2
+
+device = torch.device("cpu")
+batch = 8
+epochs = 100
+imgsz = 1280
+
+if(torch.cuda.is_available()):
+    batch = 8
+    epochs = 100
+    imgsz = 1280
+    device = torch.device("cuda")
+elif(torch.backends.mps.is_available()):
+    batch = 8
+    epochs = 100
+    imgsz = 1280
+    device = torch.device("mps")
 
 def move_servo(angle):
     print("[SERVO] Rotate", angle, "degrees")
@@ -19,9 +36,10 @@ model = YOLO("yolov8s.pt")
 def train_model():
     results = model.train(
         data = "datasets/Microplastics.v3i.yolov8/data.yaml",
-        epochs = 100,
-        imgsz = 1280,
-        batch = 8,
+        epochs = epochs,
+        imgsz = imgsz,
+        batch = batch,
+        device = device,
         name = "microplastics_v1"
     )
     
