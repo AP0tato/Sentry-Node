@@ -47,6 +47,10 @@ def train_model():
     print(f"mAP50-95:  {results.results_dict['metrics/mAP50-95(B)']:.4f}")
     print(f"Precision: {results.results_dict['metrics/precision(B)']:.4f}")
     print(f"Recall:    {results.results_dict['metrics/recall(B)']:.4f}")
+    
+    annotated = results.plot()          # draws boxes + labels on image
+    cv2.imshow("Detections", annotated)
+    cv2.waitKey(0)
 
 if __name__ == '__main__':
     # while True:
