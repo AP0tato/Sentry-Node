@@ -145,6 +145,72 @@ def _run_training(yaml_path, model_path, ep, img, bat, dev, workers, lr0, lrf, w
         current_process = None
         app.training_finished()
 
+# ── Test image inference ─────────────────────────────────────────────────────
+def _run_test_image(app, conf=0.25):
+    """Finds best.pt and runs inference on test_image.jpg, shows a large result window."""
+    try:
+        app.set_status("Running inference…", "yellow")
+
+        test_img = os.path.join(os.getcwd(), "test_image.jpg")
+        if not os.path.exists(test_img):
+            print("[ERROR] test_image.jpg not found in current directory.\n")
+            app.set_status("Idle", "#888")
+            return
+
+        # find the most recently modified best.pt
+        checkpoints = glob.glob("runs/detect/*/weights/best.pt")
+        if not checkpoints:
+            print("[ERROR] No best.pt found — train first.\n")
+            app.set_status("Idle", "#888")
+            return
+
+        weight_path = max(checkpoints, key=os.path.getmtime)
+        print(f"[INFO] Model  : {weight_path}")
+        print(f"[INFO] Image  : {test_img}")
+        print(f"[INFO] Conf   : {conf}\n")
+
+        model   = YOLO(weight_path)
+        results = model.predict(test_img, conf=conf, verbose=True)
+
+        if not results:
+            print("[ERROR] No results returned.\n")
+            app.set_status("Idle", "#888")
+            return
+
+        res       = results[0]
+        annotated = res.plot()
+
+        # print detection summary
+        from collections import Counter
+        names  = [res.names[int(b.cls)] for b in res.boxes]
+        counts = Counter(names)
+        print(f"\n─── Detection Summary ───────────────────")
+        print(f"  Total detected : {len(names)}")
+        for cls, n in counts.most_common():
+            pct = n / len(names) * 100 if names else 0
+            print(f"  {cls:<25} {n:>3}  ({pct:.1f}%)")
+        print("─────────────────────────────────────────\n")
+
+        # scale to a large window (max 1200x900) while keeping aspect ratio
+        h, w   = annotated.shape[:2]
+        scale  = min(1200 / w, 900 / h, 1.0)
+        new_w  = int(w * scale)
+        new_h  = int(h * scale)
+        display = cv2.resize(annotated, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        cv2.namedWindow("Test Image — Detections", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Test Image — Detections", new_w, new_h)
+        cv2.imshow("Test Image — Detections", display)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+        app.set_status("Done ✓", "lime green")
+
+    except Exception as e:
+        print(f"\n[ERROR] Inference failed: {e}\n")
+        app.set_status("Error — see log", "red")
+
+
 # ── Main GUI ──────────────────────────────────────────────────────────────────
 class TrainerApp(tk.Tk):
     def __init__(self):
@@ -352,14 +418,15 @@ class TrainerApp(tk.Tk):
         # PARAMETERS
         f2 = card("⚙️ PARAMETERS", left)
         self.ep_v, self.im_v, self.ba_v = tk.IntVar(value=epochs), tk.IntVar(value=imgsz), tk.IntVar(value=batch)
-        self.lr0_v, self.lrf_v, self.wa_v, self.wo_v = tk.DoubleVar(value=0.1), tk.DoubleVar(value=0.3), tk.IntVar(value=3), tk.IntVar(value=6)
-        
+        self.lr0_v, self.lrf_v, self.wa_v, self.wo_v = tk.DoubleVar(value=0.001), tk.DoubleVar(value=0.01), tk.IntVar(value=3), tk.IntVar(value=6)
+        self.conf_v = tk.DoubleVar(value=0.25)
+
         # Grid layout for parameters to save space
         params = [
-            ("Epochs", self.ep_v), ("ImgSz", self.im_v), 
+            ("Epochs", self.ep_v), ("ImgSz", self.im_v),
             ("Batch", self.ba_v), ("Workers", self.wo_v),
             ("lr0", self.lr0_v), ("lrf", self.lrf_v),
-            ("Warmup", self.wa_v)
+            ("Warmup", self.wa_v), ("Conf", self.conf_v)
         ]
         for l, v in params:
             r = tk.Frame(f2, bg=c["CARD"]); r.pack(fill="x", pady=1)
@@ -383,13 +450,15 @@ class TrainerApp(tk.Tk):
         b_fr = tk.Frame(left, bg=c["BG"])
         b_fr.pack(fill="x", pady=5)
         self.train_btn = ttk.Button(b_fr, text="▶ START TRAINING", command=self.start_training)
-        self.stop_btn = ttk.Button(b_fr, text="■ STOP", style="Stop.TButton", command=self.stop_training, state="disabled")
-        self.sim_btn = ttk.Button(b_fr, text="⚡ SIMULATE LOG", command=self.simulate_progress)
-        self.clr_btn = ttk.Button(b_fr, text="🗑 CLEAR LOG", command=self.clear_log)
+        self.stop_btn  = ttk.Button(b_fr, text="■ STOP", style="Stop.TButton", command=self.stop_training, state="disabled")
+        self.test_btn  = ttk.Button(b_fr, text="🔍 TEST IMAGE", command=self.run_test_image)
+        self.sim_btn   = ttk.Button(b_fr, text="⚡ SIMULATE LOG", command=self.simulate_progress)
+        self.clr_btn   = ttk.Button(b_fr, text="🗑 CLEAR LOG", command=self.clear_log)
         self.train_btn.pack(side="left", expand=True, fill="x", padx=2)
-        self.stop_btn.pack(side="left", expand=True, fill="x", padx=2)
-        self.sim_btn.pack(side="left", expand=True, fill="x", padx=2)
-        self.clr_btn.pack(side="left", expand=True, fill="x", padx=2)
+        self.stop_btn.pack(side="left",  expand=True, fill="x", padx=2)
+        self.test_btn.pack(side="left",  expand=True, fill="x", padx=2)
+        self.sim_btn.pack(side="left",   expand=True, fill="x", padx=2)
+        self.clr_btn.pack(side="left",   expand=True, fill="x", padx=2)
 
         # Log
         tk.Label(right, text="📋 TRAINING LOG", bg=c["BG"], fg=c["HL"], font=("Consolas", 9, "bold")).pack(anchor="w")
@@ -422,6 +491,14 @@ class TrainerApp(tk.Tk):
             self.dev_v.get(), self.wo_v.get(), self.lr0_v.get(), 
             self.lrf_v.get(), self.wa_v.get(), self.res_v.get(), self
         ), daemon=True).start()
+
+    def run_test_image(self):
+        """Launch test image inference in a background thread."""
+        threading.Thread(
+            target=_run_test_image,
+            args=(self, float(self.conf_v.get())),
+            daemon=True,
+        ).start()
 
     def simulate_progress(self):
         """Emit ANSI-colored progress updates with '\r' into the log_queue for testing."""

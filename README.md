@@ -33,6 +33,12 @@ pip install pytorch torchvision
 pip install ultralytics
 
 # Windows
+
+# Check cuda version (Do one the commands)
+nvidia-smi
+nvcc --version
+
+# Library Downloads
 pip install pytorch torchvision # If using CPU
 pip install pytorch torchvision --index-url https://download.pytorch.org/whl/cu128
 # Replace 128 with your cuda version, the latest cuda version is 128
