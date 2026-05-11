@@ -1,518 +1,878 @@
-from ultralytics import YOLO
-import time
-import queue
-import threading
+"""
+Microplastics YOLO Trainer
+──────────────────────────
+GUI front-end for training YOLO models on microplastics datasets.
+"""
+
+import atexit
+import glob
+import os
+import shutil
 import subprocess
 import sys
-import os
-import glob
-import re
-import shutil
-import torch
+import tempfile
+import threading
+from collections import Counter
+from pathlib import Path
+
 import cv2
+import torch
+import yaml
 import tkinter as tk
-from tkinter import ttk, filedialog
-import atexit
+from tkinter import ttk, filedialog, messagebox
+from ultralytics import YOLO
+
+
+# ── Environment ───────────────────────────────────────────────────────────────
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 
 # ── Device detection ──────────────────────────────────────────────────────────
-device = "cpu"
-batch  = 8
-epochs = 50
-imgsz  = 1280
+def _detect_device():
+    if torch.cuda.is_available():
+        return "cuda", 4, 100, 1280
+    if torch.backends.mps.is_available():
+        return "mps", 8, 100, 1280
+    return "cpu", 8, 50, 1280
 
-if torch.cuda.is_available():
-    batch, epochs, imgsz, device = 4, 100, 1280, "cuda"
-elif torch.backends.mps.is_available():
-    batch, epochs, imgsz, device = 8, 100, 1280, "mps"
+DEVICE, BATCH, EPOCHS, IMGSZ = _detect_device()
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  THREAD-SAFE LOG QUEUE
-# ─────────────────────────────────────────────────────────────────────────────
-ANSI_RE  = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
-log_queue: "queue.Queue[str]" = queue.Queue()
+# ── Global process handle ─────────────────────────────────────────────────────
+_current_process: "subprocess.Popen | None" = None
+_stop_flag = False
+_stop_event = threading.Event()
+_resume_flag = False
 
-class QueueWriter:
-    def __init__(self, original):
-        self.original = original
-        self._lock    = threading.Lock()
-    def write(self, text):
-        if not text: return
+# ══════════════════════════════════════════════════════════════════════════════
+#  Dataset utilities
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _repair_label_dir(label_dir: str, nc: int) -> tuple[int, int, int]:
+    files_changed = 0
+    segments_fixed = 0
+    lines_removed = 0
+
+    for txt_path in Path(label_dir).glob("*.txt"):
         try:
-            self.original.write(text)
-            self.original.flush()
-        except: pass
-        # Do not strip ANSI here. Keep GUI stripping centralized in _poll_log.
-        with self._lock: log_queue.put(text)
-    def flush(self):
-        try: self.original.flush()
-        except: pass
-    def fileno(self): return self.original.fileno()
+            raw_lines = txt_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception as exc:
+            print(f"[FIX]   Cannot read {txt_path.name}: {exc}", flush=True)
+            continue
 
-# ── Training worker ───────────────────────────────────────────────────────────
-current_process = None
-stop_flag = False
+        new_lines: list[str] = []
+        changed = False
 
-def _run_training(yaml_path, model_path, ep, img, bat, dev, workers, lr0, lrf, warmup, resume, app):
-    global current_process, stop_flag
-    stop_flag = False
-    try:
-        app.set_status("Training…", "yellow")
-        yolo_exe = os.path.join(os.path.dirname(sys.executable), "yolo.exe")
-        yolo_cmd = yolo_exe if os.path.exists(yolo_exe) else (shutil.which("yolo") or "yolo")
+        for line in raw_lines:
+            parts = line.strip().split()
+            if not parts:
+                continue
 
-        cmd = [
-            yolo_cmd, "train", f"data={yaml_path}", f"model={model_path}",
-            f"epochs={ep}", f"imgsz={img}", f"batch={bat}", f"device={dev}",
-            f"workers={workers}", f"lr0={lr0}", f"lrf={lrf}", f"warmup_epochs={warmup}",
-            "name=microplastics_run"
-        ]
-        if resume: cmd.append("resume=True")
-
-        current_process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0,
-        )
-
-        if current_process.stdout:
-            # Reconfigure the real stdout to UTF-8 so Unicode chars from the
-            # subprocess (e.g. box-drawing, emoji) don't hit a charmap error.
             try:
-                sys.__stdout__.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
-            with open("subprocess_chunks.log", "w", encoding="utf-8") as f:
-                # readline() only returns on \n, so YOLO's \r-terminated
-                # progress updates get held in the buffer until the next \n,
-                # causing them to arrive in a batch and print on new lines.
-                # Instead we accumulate chars and flush the segment to the
-                # queue on every \r or \n so the GUI sees each update promptly.
-                buf = []
-                while True:
-                    ch = current_process.stdout.read(1)
-                    if ch == "":
-                        # EOF — flush whatever remains
-                        if buf:
-                            segment = "".join(buf)
-                            try:
-                                sys.__stdout__.write(segment)
-                                sys.__stdout__.flush()
-                            except Exception:
-                                pass
-                            f.write(f"SEG: {repr(segment)}\n")
-                            f.flush()
-                            log_queue.put(segment)
-                        break
-                    buf.append(ch)
-                    if ch in ("\r", "\n"):
-                        segment = "".join(buf)
-                        buf = []
-                        try:
-                            sys.__stdout__.write(segment)
-                            sys.__stdout__.flush()
-                        except Exception:
-                            pass
-                        f.write(f"SEG: {repr(segment)}\n")
-                        f.flush()
-                        log_queue.put(segment)
+                cls_id = int(float(parts[0]))
+            except ValueError:
+                lines_removed += 1
+                changed = True
+                continue
 
-        return_code = current_process.wait()
-        
-        if stop_flag:
-            app.set_status("Stopped", "orange")
-        elif return_code == 0:
-            app.set_status("Done ✓", "lime green")
-            # Post-train Inference
-            test_img = os.path.join(os.getcwd(), "test_image.jpg")
-            if os.path.exists(test_img):
-                weight_candidates = ["runs/detect/microplastics_run/weights/best.pt", "runs/detect/microplastics_run/weights/last.pt"]
-                weight_path = next((c for c in weight_candidates if os.path.exists(c)), None)
-                
-                if weight_path:
-                    print(f"\n[INFO] Running test on {test_img}\n")
-                    model = YOLO(weight_path)
-                    res = model.predict(test_img, verbose=False)
-                    if res:
-                        cv2.imshow("Result", res[0].plot())
-                        cv2.waitKey(0)
-                        cv2.destroyAllWindows()
-        else:
-            app.set_status("Error — see log", "red")
-    except Exception as e:
-        print(f"\n[ERROR] {e}\n")
-        app.set_status("Error", "red")
-    finally:
-        current_process = None
-        app.training_finished()
+            if cls_id < 0 or cls_id >= nc:
+                lines_removed += 1
+                changed = True
+                continue
 
-# ── Test image inference ─────────────────────────────────────────────────────
-def _run_test_image(app, conf=0.25):
-    """Finds best.pt and runs inference on test_image.jpg, shows a large result window."""
+            if len(parts) < 5:
+                lines_removed += 1
+                changed = True
+                continue
+
+            if len(parts) > 5:
+                parts = parts[:5]
+                segments_fixed += 1
+                changed = True
+
+            try:
+                coords = [float(p) for p in parts[1:]]
+            except ValueError:
+                lines_removed += 1
+                changed = True
+                continue
+
+            if any(v < 0.0 or v > 1.0 for v in coords):
+                lines_removed += 1
+                changed = True
+                continue
+
+            new_lines.append(f"{cls_id} " + " ".join(parts[1:]))
+
+        if changed:
+            txt_path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""),
+                                encoding="utf-8")
+            files_changed += 1
+
+    return files_changed, segments_fixed, lines_removed
+
+
+def _delete_caches(dataset_dir: str) -> int:
+    deleted = 0
+    for cache in Path(dataset_dir).rglob("*.cache"):
+        try:
+            cache.unlink()
+            print(f"[FIX] Deleted cache: {cache}", flush=True)
+            deleted += 1
+        except Exception as exc:
+            print(f"[FIX] Could not delete {cache}: {exc}", flush=True)
+    return deleted
+
+
+def _run_fix_dataset(yaml_path: str, app: "TrainerApp") -> None:
     try:
-        app.set_status("Running inference…", "yellow")
+        app.set_status("Fixing dataset…", "yellow")
 
-        test_img = os.path.join(os.getcwd(), "test_image.jpg")
-        if not os.path.exists(test_img):
-            print("[ERROR] test_image.jpg not found in current directory.\n")
-            app.set_status("Idle", "#888")
-            return
+        with open(yaml_path) as fh:
+            data = yaml.safe_load(fh)
 
-        # find the most recently modified best.pt
-        checkpoints = glob.glob("runs/detect/*/weights/best.pt")
-        if not checkpoints:
-            print("[ERROR] No best.pt found — train first.\n")
-            app.set_status("Idle", "#888")
-            return
+        nc: int = int(data.get("nc", 0))
+        dataset_dir = os.path.dirname(yaml_path)
 
-        weight_path = max(checkpoints, key=os.path.getmtime)
-        print(f"[INFO] Model  : {weight_path}")
-        print(f"[INFO] Image  : {test_img}")
-        print(f"[INFO] Conf   : {conf}\n")
+        print(f"\n[FIX] Dataset : {dataset_dir}", flush=True)
+        print(f"[FIX] Classes : {nc}\n", flush=True)
 
-        model   = YOLO(weight_path)
-        results = model.predict(test_img, conf=conf, verbose=True)
+        total_files = total_segs = total_removed = 0
 
-        if not results:
-            print("[ERROR] No results returned.\n")
-            app.set_status("Idle", "#888")
-            return
+        for split in ("train", "valid", "test"):
+            label_dir = os.path.join(dataset_dir, split, "labels")
+            if not os.path.isdir(label_dir):
+                continue
 
-        res       = results[0]
-        annotated = res.plot()
+            n_txt = len(list(Path(label_dir).glob("*.txt")))
+            print(f"[FIX] Scanning {split}: {n_txt} label files…", flush=True)
+            fc, sf, lr = _repair_label_dir(label_dir, nc)
+            total_files   += fc
+            total_segs    += sf
+            total_removed += lr
 
-        # print detection summary
-        from collections import Counter
-        names  = [res.names[int(b.cls)] for b in res.boxes]
-        counts = Counter(names)
-        print(f"\n─── Detection Summary ───────────────────")
-        print(f"  Total detected : {len(names)}")
-        for cls, n in counts.most_common():
-            pct = n / len(names) * 100 if names else 0
-            print(f"  {cls:<25} {n:>3}  ({pct:.1f}%)")
-        print("─────────────────────────────────────────\n")
+        cache_count = _delete_caches(dataset_dir)
 
-        # scale to a large window (max 1200x900) while keeping aspect ratio
-        h, w   = annotated.shape[:2]
-        scale  = min(1200 / w, 900 / h, 1.0)
-        new_w  = int(w * scale)
-        new_h  = int(h * scale)
-        display = cv2.resize(annotated, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        print(f"\n[FIX] ── Summary ─────────────────────────", flush=True)
+        print(f"[FIX]   Files modified        : {total_files}", flush=True)
+        print(f"[FIX]   Segment→bbox fixed    : {total_segs}", flush=True)
+        print(f"[FIX]   Bad lines removed     : {total_removed}", flush=True)
+        print(f"[FIX]   Cache files deleted   : {cache_count}", flush=True)
+        print(f"[FIX] ─────────────────────────────────────", flush=True)
+        print(f"[FIX] Dataset is ready — you can now train.\n", flush=True)
 
-        cv2.namedWindow("Test Image — Detections", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Test Image — Detections", new_w, new_h)
-        cv2.imshow("Test Image — Detections", display)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+        app.set_status("Dataset fixed ✓", "lime green")
 
-        app.set_status("Done ✓", "lime green")
-
-    except Exception as e:
-        print(f"\n[ERROR] Inference failed: {e}\n")
+    except Exception as exc:
+        print(f"\n[ERROR] Fix dataset failed: {exc}\n", flush=True)
         app.set_status("Error — see log", "red")
 
 
-# ── Main GUI ──────────────────────────────────────────────────────────────────
+def _run_clean_dataset(yaml_path: str, keep_classes: set[str],
+                       app: "TrainerApp") -> None:
+    try:
+        app.set_status("Cleaning dataset…", "yellow")
+
+        with open(yaml_path) as fh:
+            data = yaml.safe_load(fh)
+
+        all_names: list[str] = data["names"]
+        kept_indices = [i for i, n in enumerate(all_names) if n in keep_classes]
+        old_to_new   = {old: new for new, old in enumerate(kept_indices)}
+        new_names    = [all_names[i] for i in kept_indices]
+        new_nc       = len(new_names)
+
+        print(f"\n[CLEAN] Keeping {new_nc} classes:", flush=True)
+        for i, n in enumerate(new_names):
+            print(f"  [{i}] {n}", flush=True)
+        print(flush=True)
+
+        dataset_dir = os.path.dirname(yaml_path)
+        total_removed = 0
+
+        for split in ("train", "valid", "test"):
+            label_dir = os.path.join(dataset_dir, split, "labels")
+            if not os.path.isdir(label_dir):
+                continue
+
+            for txt_path in Path(label_dir).glob("*.txt"):
+                try:
+                    raw = txt_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                except Exception:
+                    continue
+
+                new_lines: list[str] = []
+                for line in raw:
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    try:
+                        cls_id = int(float(parts[0]))
+                    except ValueError:
+                        total_removed += 1
+                        continue
+                    if cls_id not in old_to_new:
+                        total_removed += 1
+                        continue
+                    parts[0] = str(old_to_new[cls_id])
+                    new_lines.append(" ".join(parts))
+
+                txt_path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""),
+                                    encoding="utf-8")
+
+            _repair_label_dir(label_dir, new_nc)
+
+        data["nc"]    = new_nc
+        data["names"] = new_names
+        with open(yaml_path, "w") as fh:
+            yaml.dump(data, fh, default_flow_style=False, allow_unicode=True)
+
+        _delete_caches(dataset_dir)
+
+        print(f"[CLEAN] Removed {total_removed} label entries.", flush=True)
+        print(f"[CLEAN] Updated data.yaml → {new_nc} classes.\n", flush=True)
+        app.set_status("Dataset cleaned ✓", "lime green")
+
+    except Exception as exc:
+        print(f"\n[ERROR] Dataset clean failed: {exc}\n", flush=True)
+        app.set_status("Error — see log", "red")
+
+
+def _run_oversample(yaml_path: str, target_ratio: float,
+                    app: "TrainerApp") -> None:
+    try:
+        app.set_status("Oversampling…", "yellow")
+
+        with open(yaml_path) as fh:
+            data = yaml.safe_load(fh)
+
+        dataset_dir = os.path.dirname(yaml_path)
+        label_dir   = os.path.join(dataset_dir, "train", "labels")
+        image_dir   = os.path.join(dataset_dir, "train", "images")
+
+        if not os.path.isdir(label_dir) or not os.path.isdir(image_dir):
+            print("[OVERSAMPLE] train/labels or train/images directory not found.\n", flush=True)
+            app.set_status("Error — see log", "red")
+            return
+
+        class_to_files: dict[int, list[Path]] = {}
+        for txt in Path(label_dir).glob("*.txt"):
+            classes_in_file: set[int] = set()
+            for line in txt.read_text(encoding="utf-8", errors="replace").splitlines():
+                parts = line.strip().split()
+                if parts:
+                    try:
+                        classes_in_file.add(int(float(parts[0])))
+                    except ValueError:
+                        pass
+            for cls_id in classes_in_file:
+                class_to_files.setdefault(cls_id, []).append(txt)
+
+        if not class_to_files:
+            print("[OVERSAMPLE] No annotated label files found in train/labels.\n", flush=True)
+            app.set_status("Error — see log", "red")
+            return
+
+        max_count = max(len(v) for v in class_to_files.values())
+        target    = int(max_count * target_ratio)
+        names     = data.get("names", [])
+
+        print(f"\n[OVERSAMPLE] Most-common class count : {max_count}", flush=True)
+        print(f"[OVERSAMPLE] Target per-class count  : {target}  ({target_ratio*100:.0f}% of max)\n", flush=True)
+
+        total_copies = 0
+        for cls_id, files in sorted(class_to_files.items()):
+            current = len(files)
+            needed  = max(0, target - current)
+            name    = names[cls_id] if cls_id < len(names) else str(cls_id)
+
+            if needed == 0:
+                print(f"  [{name}]  {current} samples — no copies needed", flush=True)
+                continue
+
+            print(f"  [{name}]  {current} samples → adding {needed} copies", flush=True)
+
+            for i in range(needed):
+                src_lbl = files[i % len(files)]
+                stem    = src_lbl.stem
+
+                src_img: "Path | None" = None
+                for ext in (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"):
+                    candidate = Path(image_dir) / (stem + ext)
+                    if candidate.exists():
+                        src_img = candidate
+                        break
+
+                if src_img is None:
+                    continue
+
+                new_stem = f"{stem}_os{i:05d}"
+                dst_lbl  = Path(label_dir) / (new_stem + ".txt")
+                dst_img  = Path(image_dir) / (new_stem + src_img.suffix)
+
+                shutil.copy2(src_lbl, dst_lbl)
+                shutil.copy2(src_img, dst_img)
+                total_copies += 1
+
+        _delete_caches(dataset_dir)
+        print(f"\n[OVERSAMPLE] Done — {total_copies} image+label pairs copied.\n", flush=True)
+        app.set_status("Oversample done ✓", "lime green")
+
+    except Exception as exc:
+        print(f"\n[ERROR] Oversample failed: {exc}\n", flush=True)
+        app.set_status("Error — see log", "red")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Training worker
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_training(yaml_path: str, model_path: str,
+                  ep: int, img: int, bat: int, dev: str,
+                  workers: int, lr0: float, lrf: float,
+                  warmup: int, cache_mode: str,
+                  cls_gain: float, box_gain: float,
+                  app: "TrainerApp", checkpoint_path: str = "") -> None:
+    global _stop_flag, _resume_flag
+    _stop_flag = False
+    _stop_event.clear()
+
+    try:
+        app.set_status("Training…", "yellow")
+
+        print(f"[INFO] Device    : {dev.upper()}", flush=True)
+        print(f"[INFO] epochs={ep}  imgsz={img}  batch={bat}", flush=True)
+        print(f"[INFO] cache={cache_mode}", flush=True)
+        print(f"[INFO] Starting training via Python API", flush=True)
+        print(f"[INFO] cls={cls_gain}  box={box_gain}\n", flush=True)
+
+        cache_arg = False if cache_mode == "none" else cache_mode
+
+        if _resume_flag:
+            print(f"[INFO] Resuming training from checkpoint\n", flush=True)
+            if not checkpoint_path or not os.path.exists(checkpoint_path):
+                print(f"[ERROR] Checkpoint file not selected or not found\n", flush=True)
+                app.set_status("Error — checkpoint not selected", "red")
+                _resume_flag = False
+                app.training_finished()
+                return
+            
+            model = YOLO(checkpoint_path)
+            model.train(
+                resume=True,
+            )
+        else:
+            model = YOLO(model_path)
+            model.train(
+                data=yaml_path,
+                epochs=ep,
+                imgsz=img,
+                batch=bat,
+                device=dev,
+                workers=workers,
+                lr0=lr0,
+                lrf=lrf,
+                warmup_epochs=float(warmup),
+                cls=cls_gain,
+                box=box_gain,
+                name="microplastics_run",
+                cache=cache_arg,
+            )
+
+        if _stop_flag:
+            app.set_status("Stopped", "orange")
+        else:
+            app.set_status("Done ✓", "lime green")
+            _run_test_image(app, conf=float(app.conf_v.get()), iou=float(app.iou_v.get()), auto=True)
+
+    except Exception as exc:
+        if _stop_flag:
+            app.set_status("Stopped", "orange")
+        else:
+            print(f"\n[ERROR] Training failed: {exc}\n", flush=True)
+            app.set_status("Error — see log", "red")
+    finally:
+        _resume_flag = False
+        app.training_finished()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Inference worker
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_test_image(app: "TrainerApp", conf: float = 0.25, iou: float = 0.45,
+                    auto: bool = False) -> None:
+    try:
+        if not auto:
+            app.set_status("Running inference…", "yellow")
+
+        test_img = os.path.join(os.getcwd(), "test_image.jpg")
+        if not os.path.exists(test_img):
+            print("[ERROR] test_image.jpg not found in the current directory.\n", flush=True)
+            if not auto:
+                app.set_status("Idle", "#888")
+            return
+
+        checkpoints = glob.glob("runs/detect/*/weights/best.pt")
+        if not checkpoints:
+            print("[ERROR] No best.pt found — train the model first.\n", flush=True)
+            if not auto:
+                app.set_status("Idle", "#888")
+            return
+
+        weight_path = max(checkpoints, key=os.path.getmtime)
+        print(f"\n[INFO] Weights : {weight_path}", flush=True)
+        print(f"[INFO] Image   : {test_img}", flush=True)
+        print(f"[INFO] Conf    : {conf}", flush=True)
+        print(f"[INFO] IOU     : {iou}\n", flush=True)
+
+        model   = YOLO(weight_path)
+        results = model.predict(test_img, conf=conf, iou=iou, verbose=True)
+
+        if not results:
+            print("[ERROR] No results returned.\n", flush=True)
+            if not auto:
+                app.set_status("Idle", "#888")
+            return
+
+        res = results[0]
+        # Applied the show_labels toggle
+        annotated = res.plot(labels=app.show_labels_v.get())
+
+        boxes = res.boxes if res.boxes is not None else []
+        det_names = [res.names[int(b.cls)] for b in boxes]
+        counts = Counter(det_names)
+        print("─── Detection Summary ───────────────────", flush=True)
+        print(f"  Total detected : {len(det_names)}", flush=True)
+        if det_names:
+            for cls, n in counts.most_common():
+                pct = n / len(det_names) * 100
+                print(f"  {cls:<25} {n:>3}  ({pct:.1f}%)", flush=True)
+        else:
+            print("  No objects detected.", flush=True)
+        print("─────────────────────────────────────────\n", flush=True)
+
+        h, w  = annotated.shape[:2]
+        scale = min(1200 / w, 900 / h, 1.0)
+        disp  = cv2.resize(annotated, (int(w * scale), int(h * scale)),
+                           interpolation=cv2.INTER_AREA)
+
+        cv2.namedWindow("Detections", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Detections", int(w * scale), int(h * scale))
+        cv2.imshow("Detections", disp)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+        if not auto:
+            app.set_status("Done ✓", "lime green")
+
+    except Exception as exc:
+        print(f"\n[ERROR] Inference failed: {exc}\n", flush=True)
+        if not auto:
+            app.set_status("Error — see log", "red")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Clean Dataset dialog
+# ══════════════════════════════════════════════════════════════════════════════
+
+_JUNK_DEFAULTS = {
+    "Microbead", "Insect matter", "Easylift tab",
+    "Anthropogenic", "Salt", "Unknown", "Natural material",
+}
+
+
+class CleanDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Tk, yaml_path: str, app: "TrainerApp"):
+        super().__init__(parent)
+        self.title("Clean Dataset — Select Classes to KEEP")
+        self.configure(bg="#1a1a2e")
+        self.resizable(False, False)
+        self.grab_set()
+
+        self.yaml_path = yaml_path
+        self.app = app
+
+        c = _COLORS
+
+        try:
+            with open(yaml_path) as fh:
+                data = yaml.safe_load(fh)
+            names: list[str] = data.get("names", [])
+        except Exception as exc:
+            messagebox.showerror("Error", f"Could not read YAML:\n{exc}")
+            self.destroy()
+            return
+
+        tk.Label(self,
+                 text="✅  Tick classes to KEEP  (untick = remove)",
+                 bg=c["BG"], fg=c["HL"],
+                 font=("Consolas", 10, "bold")).pack(padx=16, pady=(12, 4))
+
+        canvas = tk.Canvas(self, bg=c["CARD"], highlightthickness=0,
+                           width=380, height=400)
+        sb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", padx=(0, 4), pady=8)
+        canvas.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=8)
+
+        inner = tk.Frame(canvas, bg=c["CARD"])
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win_id, width=e.width))
+
+        self.vars: dict[str, tk.BooleanVar] = {}
+        for name in names:
+            var = tk.BooleanVar(value=(name not in _JUNK_DEFAULTS))
+            self.vars[name] = var
+            tk.Checkbutton(
+                inner, text=name, variable=var,
+                bg=c["CARD"], fg=c["FG"], selectcolor=c["ACC"],
+                activebackground=c["CARD"], activeforeground=c["HL"],
+                font=("Consolas", 9),
+            ).pack(anchor="w", padx=8, pady=1)
+
+        btn_fr = tk.Frame(self, bg=c["BG"])
+        btn_fr.pack(fill="x", padx=12, pady=(4, 12))
+        ttk.Button(btn_fr, text="✅  Apply & Clean",
+                   command=self._apply).pack(side="left", expand=True,
+                                             fill="x", padx=(0, 4))
+        ttk.Button(btn_fr, text="✖  Cancel",
+                   command=self.destroy).pack(side="left", expand=True, fill="x")
+
+    def _apply(self):
+        keep = {name for name, var in self.vars.items() if var.get()}
+        if not keep:
+            messagebox.showwarning("Nothing selected",
+                                   "Select at least one class to keep.")
+            return
+        self.destroy()
+        threading.Thread(
+            target=_run_clean_dataset,
+            args=(self.yaml_path, keep, self.app),
+            daemon=True,
+        ).start()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Colour palette
+# ══════════════════════════════════════════════════════════════════════════════
+
+_COLORS = {
+    "BG":    "#1a1a2e",
+    "CARD":  "#16213e",
+    "ACC":   "#0f3460",
+    "HL":    "#e94560",
+    "FG":    "#eaeaea",
+    "INPUT": "#0d1b2a",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Main GUI
+# ══════════════════════════════════════════════════════════════════════════════
+
 class TrainerApp(tk.Tk):
+
     def __init__(self):
         super().__init__()
         self.title("Microplastics YOLO Trainer")
-        self.configure(bg="#1a1a2e")
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.configure(bg=_COLORS["BG"])
+        self.minsize(500, 720)
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
         self._build_styles()
         self._build_ui()
 
-        sys.stdout = QueueWriter(sys.__stdout__)
-        sys.stderr = QueueWriter(sys.__stderr__)
+        atexit.register(self._cleanup_subprocess)
 
-        self._log_partial, self._ansi_in_progress, self._pending_r = "", False, False
-        self._line_open = False  # True when a \x1b[K line is held open (no \n)
-        # Track the start index of the current last (partial) line so we can
-        # delete/overwrite it when a '\r' update arrives.
-        self._last_line_start = None
-        self._poll_log()
-        atexit.register(self.cleanup_subprocess)
+        print(f"[INFO] Device : {DEVICE.upper()}", flush=True)
+        print(f"[INFO] epochs={EPOCHS}  imgsz={IMGSZ}  batch={BATCH}\n", flush=True)
 
-    def on_closing(self):
-        self.cleanup_subprocess()
+    def _on_closing(self):
+        self._cleanup_subprocess()
         self.destroy()
         sys.exit(0)
 
-    def cleanup_subprocess(self):
-        global current_process
-        if current_process and current_process.poll() is None:
+    def _cleanup_subprocess(self):
+        global _current_process
+        if _current_process and _current_process.poll() is None:
             try:
-                current_process.terminate()
-                current_process.wait(timeout=2)
-            except:
-                try: current_process.kill()
-                except: pass
-            current_process = None
+                _current_process.terminate()
+                _current_process.wait(timeout=2)
+            except Exception:
+                try:
+                    _current_process.kill()
+                except Exception:
+                    pass
+        _current_process = None
 
-    def _safe_linestart(self):
-        try:
-            return self.log_box.index("end-1c linestart")
-        except Exception:
-            return None
+    def set_status(self, text: str, color: str):
+        self.after(0, lambda: self.status_lbl.configure(
+            text=f"● {text}", fg=color))
 
-    def _poll_log(self):
-        parts = []
-        while not log_queue.empty():
-            parts.append(log_queue.get_nowait())
-
-        if parts:
-            self.log_box.configure(state="normal")
-            for chunk in parts:
-                # YOLO uses \x1b[K (erase-to-end-of-line) before each progress
-                # update instead of \r.  Detect it BEFORE stripping ANSI so we
-                # know to overwrite the last line rather than append a new one.
-                erase_line = '\x1b[K' in chunk
-
-                # Strip all ANSI escape sequences
-                cleaned = ANSI_RE.sub('', chunk)
-
-                # Normalize \r\n → \n, handle backspaces
-                cleaned = cleaned.replace('\r\n', '\n')
-                buf = []
-                for ch in cleaned:
-                    if ch == '\x08':
-                        if buf: buf.pop()
-                    else:
-                        buf.append(ch)
-                cleaned = ''.join(buf)
-
-                # A bare \r also means overwrite
-                overwrite = erase_line or cleaned.startswith('\r')
-                cleaned = cleaned.lstrip('\r')
-
-                if not cleaned:
-                    continue
-
-                # If this chunk is NOT an overwrite but the previous \x1b[K line
-                # was left open (no \n emitted), close it now so this content
-                # starts on a fresh line instead of being appended mid-line.
-                if not overwrite and self._line_open:
-                    self.log_box.insert(tk.END, '\n')
-                    self._last_line_start = None
-                    self._line_open = False
-
-                # Split on \n keeping the delimiter tokens
-                parts_inner = re.split(r'(\n)', cleaned)
-                first = True
-                j = 0
-                while j < len(parts_inner):
-                    token = parts_inner[j]
-
-                    if token == '\n':
-                        self.log_box.insert(tk.END, '\n')
-                        self._last_line_start = None
-                        self._line_open = False
-                        j += 1
-                        first = False
-                        continue
-
-                    if not token:
-                        j += 1
-                        continue
-
-                    if overwrite and first:
-                        # Delete the previous progress line and write new content
-                        try:
-                            start = self._last_line_start or self._safe_linestart()
-                            self.log_box.delete(start, "end-1c")
-                        except Exception:
-                            start = self._safe_linestart()
-                        self.log_box.insert(tk.END, token)
-                        if self._last_line_start is None:
-                            self._last_line_start = self._safe_linestart()
-                    else:
-                        if self._last_line_start is None:
-                            self._last_line_start = self._safe_linestart()
-                        self.log_box.insert(tk.END, token)
-
-                    first = False
-                    j += 1
-
-                # If this was an overwrite chunk, its \n was the last token and
-                # was already emitted above.  But YOLO's progress lines end with
-                # \n which we DO want to suppress so the next \x1b[K overwrites
-                # the same line.  Re-check: if erase_line and the cleaned text
-                # ended with \n, that \n was already written — undo it by
-                # deleting the last char and marking the line as open.
-                if erase_line and cleaned.endswith('\n'):
-                    try:
-                        self.log_box.delete("end-2c", "end-1c")  # remove the \n
-                    except Exception:
-                        pass
-                    self._line_open = True
-                    # Reset _last_line_start to this line so next overwrite
-                    # knows where to delete from.
-                    self._last_line_start = self._safe_linestart()
-
-            self.log_box.see(tk.END)
-            self.log_box.configure(state="disabled")
-
-        self.after(80, self._poll_log)
-
-    def _build_styles(self):
-        s = ttk.Style(self)
-        s.theme_use("clam")
-        # Palette: BG: Deep Navy, CARD: Slate, ACC: Blue, HL: Pink/Red, FG: Off-white
-        c = {"BG": "#1a1a2e", "CARD": "#16213e", "ACC": "#0f3460", "HL": "#e94560", "FG": "#eaeaea", "INPUT": "#0d1b2a"}
-        self.colors = c
-        
-        # 1. Labels
-        s.configure("TLabel", background=c["CARD"], foreground=c["FG"], font=("Consolas", 10))
-        
-        # 2. Textboxes (Entry) & Spinboxes
-        # We apply the dark 'INPUT' color to the fieldbackground
-        s.configure("TEntry", 
-                    fieldbackground=c["INPUT"], 
-                    foreground=c["FG"], 
-                    insertcolor=c["FG"], 
-                    borderwidth=0)
-        
-        s.configure("TSpinbox", 
-                    fieldbackground=c["INPUT"], 
-                    foreground=c["FG"], 
-                    insertcolor=c["FG"], 
-                    borderwidth=0)
-
-        # 3. Buttons
-        s.configure("TButton", background=c["ACC"], foreground=c["FG"], font=("Consolas", 10, "bold"), borderwidth=0)
-        s.map("TButton", background=[("active", c["HL"])])
-        s.configure("Stop.TButton", background="#7a0020", foreground=c["FG"])
-        
-        # 4. Checkbutton - FIXED HOVER
-        s.configure("TCheckbutton", background=c["CARD"], foreground=c["FG"], font=("Consolas", 10))
-        s.map("TCheckbutton", 
-              background=[("active", c["CARD"])],  # Keep background dark on hover
-              foreground=[("active", c["HL"])])     # Turn text highlight color on hover
-
-    def _build_ui(self):
-        c = self.colors
-        top = tk.Frame(self, bg=c["BG"], pady=10)
-        top.pack(fill="x", padx=18)
-        tk.Label(top, text="🔬 MICROPLASTICS TRAINER", bg=c["BG"], fg=c["HL"], font=("Consolas", 14, "bold")).pack(side="left")
-        self.status_lbl = tk.Label(top, text="● Idle", bg=c["BG"], fg="#888", font=("Consolas", 10))
-        self.status_lbl.pack(side="right")
-
-        pane = tk.PanedWindow(self, orient="horizontal", bg=c["BG"], sashwidth=4)
-        pane.pack(fill="both", expand=True, padx=12, pady=12)
-        left, right = tk.Frame(pane, bg=c["BG"]), tk.Frame(pane, bg=c["BG"])
-        pane.add(left, minsize=380); pane.add(right, minsize=450)
-
-        def card(t, p):
-            tk.Label(p, text=t, bg=c["BG"], fg=c["HL"], font=("Consolas", 9, "bold")).pack(anchor="w")
-            f = tk.Frame(p, bg=c["CARD"], padx=10, pady=8); f.pack(fill="x", pady=(2, 8)); return f
-
-        # FILES
-        f1 = card("📁 FILES", left)
-        self.yaml_var, self.model_var = tk.StringVar(), tk.StringVar(value="yolo26n.pt")
-        for l, v in [("Dataset", self.yaml_var), ("Model", self.model_var)]:
-            r = tk.Frame(f1, bg=c["CARD"]); r.pack(fill="x", pady=2)
-            tk.Label(r, text=l, width=12, anchor="w", bg=c["CARD"], fg=c["FG"]).pack(side="left")
-            ttk.Entry(r, textvariable=v).pack(side="left", fill="x", expand=True)
-            ttk.Button(r, text="..", width=3, command=lambda var=v: var.set(filedialog.askopenfilename())).pack(side="left", padx=2)
-
-        # PARAMETERS
-        f2 = card("⚙️ PARAMETERS", left)
-        self.ep_v, self.im_v, self.ba_v = tk.IntVar(value=epochs), tk.IntVar(value=imgsz), tk.IntVar(value=batch)
-        self.lr0_v, self.lrf_v, self.wa_v, self.wo_v = tk.DoubleVar(value=0.001), tk.DoubleVar(value=0.01), tk.IntVar(value=3), tk.IntVar(value=6)
-        self.conf_v = tk.DoubleVar(value=0.25)
-
-        # Grid layout for parameters to save space
-        params = [
-            ("Epochs", self.ep_v), ("ImgSz", self.im_v),
-            ("Batch", self.ba_v), ("Workers", self.wo_v),
-            ("lr0", self.lr0_v), ("lrf", self.lrf_v),
-            ("Warmup", self.wa_v), ("Conf", self.conf_v)
-        ]
-        for l, v in params:
-            r = tk.Frame(f2, bg=c["CARD"]); r.pack(fill="x", pady=1)
-            tk.Label(r, text=l, width=12, anchor="w", bg=c["CARD"], fg=c["FG"]).pack(side="left")
-            if isinstance(v, tk.DoubleVar):
-                ttk.Entry(r, textvariable=v, width=10).pack(side="left")
-            else:
-                ttk.Spinbox(r, textvariable=v, from_=1, to=2000, width=10).pack(side="left")
-
-        # DEVICE
-        f3 = card("💻 DEVICE", left)
-        self.dev_v = tk.StringVar(value=device)
-        for o in ["cpu", "cuda", "mps"]:
-            tk.Radiobutton(f3, text=o.upper(), variable=self.dev_v, value=o, bg=c["CARD"], fg=c["FG"], selectcolor=c["ACC"]).pack(side="left", padx=5)
-
-        # OPTIONS
-        f4 = card("🔁 OPTIONS", left)
-        self.res_v = tk.BooleanVar()
-        ttk.Checkbutton(f4, text="Resume Training from last.pt", variable=self.res_v).pack(anchor="w")
-
-        b_fr = tk.Frame(left, bg=c["BG"])
-        b_fr.pack(fill="x", pady=5)
-        self.train_btn = ttk.Button(b_fr, text="▶ START TRAINING", command=self.start_training)
-        self.stop_btn  = ttk.Button(b_fr, text="■ STOP", style="Stop.TButton", command=self.stop_training, state="disabled")
-        self.test_btn  = ttk.Button(b_fr, text="🔍 TEST IMAGE", command=self.run_test_image)
-        self.sim_btn   = ttk.Button(b_fr, text="⚡ SIMULATE LOG", command=self.simulate_progress)
-        self.clr_btn   = ttk.Button(b_fr, text="🗑 CLEAR LOG", command=self.clear_log)
-        self.train_btn.pack(side="left", expand=True, fill="x", padx=2)
-        self.stop_btn.pack(side="left",  expand=True, fill="x", padx=2)
-        self.test_btn.pack(side="left",  expand=True, fill="x", padx=2)
-        self.sim_btn.pack(side="left",   expand=True, fill="x", padx=2)
-        self.clr_btn.pack(side="left",   expand=True, fill="x", padx=2)
-
-        # Log
-        tk.Label(right, text="📋 TRAINING LOG", bg=c["BG"], fg=c["HL"], font=("Consolas", 9, "bold")).pack(anchor="w")
-        self.log_box = tk.Text(right, state="disabled", bg="#0d1b2a", fg="#c8ffc8", font=("Consolas", 9), wrap="none")
-        self.log_box.pack(fill="both", expand=True)
-
-    def set_status(self, t, c): self.after(0, lambda: self.status_lbl.configure(text=f"● {t}", fg=c))
-    def training_finished(self): self.after(0, lambda: [self.train_btn.configure(state="normal"), self.stop_btn.configure(state="disabled")])
-    def stop_training(self): self.cleanup_subprocess(); self.set_status("Stopping...", "orange")
-
-    def clear_log(self):
-        """Clear the log display."""
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", tk.END)
-        self.log_box.configure(state="disabled")
-        self._last_line_start = None
-        self._ansi_in_progress = False
-        self._pending_r = False
-        self._log_partial = ""
-        self._line_open = False
+    def training_finished(self):
+        self.after(0, lambda: [
+            self.train_btn.configure(state="normal"),
+            self.stop_btn.configure(state="disabled"),
+        ])
 
     def start_training(self):
-        y, m = self.yaml_var.get(), self.model_var.get()
+        y = self.yaml_var.get().strip()
+        m = self.model_var.get().strip()
         if not y or not os.path.exists(y):
-            print("[ERROR] Dataset YAML not found.")
+            print("[ERROR] Dataset YAML not found — select it first.\n", flush=True)
             return
-        self.train_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
-        threading.Thread(target=_run_training, args=(
-            y, m, self.ep_v.get(), self.im_v.get(), self.ba_v.get(), 
-            self.dev_v.get(), self.wo_v.get(), self.lr0_v.get(), 
-            self.lrf_v.get(), self.wa_v.get(), self.res_v.get(), self
-        ), daemon=True).start()
-
-    def run_test_image(self):
-        """Launch test image inference in a background thread."""
+        self.train_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
         threading.Thread(
-            target=_run_test_image,
-            args=(self, float(self.conf_v.get())),
+            target=_run_training,
+            args=(y, m,
+                  self.ep_v.get(), self.im_v.get(), self.ba_v.get(),
+                  self.dev_v.get(), self.wo_v.get(),
+                  float(self.lr0_v.get()), float(self.lrf_v.get()),
+                  self.wa_v.get(), self.cache_v.get(),
+                  float(self.cls_v.get()), float(self.box_v.get()),
+                  self, self.checkpoint_var.get()),
             daemon=True,
         ).start()
 
-    def simulate_progress(self):
-        """Emit ANSI-colored progress updates with '\r' into the log_queue for testing."""
-        def _sim():
-            for i in range(0, 101, 5):
-                # green text with reset, using CR to overwrite
-                chunk = f"\r\x1b[32mSimulated: {i}%\x1b[0m"
-                log_queue.put(chunk)
-                time.sleep(0.12)
-            # finish with newline
-            log_queue.put("\n")
-            log_queue.put("Simulation complete.\n")
+    def resume_training(self):
+        global _resume_flag
+        _resume_flag = True
+        self.start_training()
 
-        threading.Thread(target=_sim, daemon=True).start()
+    def stop_training(self):
+        global _stop_flag
+        _stop_flag = True
+        _stop_event.set()
+        self._cleanup_subprocess()
+        self.set_status("Stopping…", "orange")
+
+    def run_test_image(self):
+        threading.Thread(
+            target=_run_test_image,
+            args=(self, float(self.conf_v.get()), float(self.iou_v.get())),
+            daemon=True,
+        ).start()
+
+    def fix_dataset(self):
+        y = self.yaml_var.get().strip()
+        if not y or not os.path.exists(y):
+            print("[ERROR] Select a dataset YAML first.\n", flush=True)
+            return
+        threading.Thread(
+            target=_run_fix_dataset,
+            args=(y, self),
+            daemon=True,
+        ).start()
+
+    def open_clean_dialog(self):
+        y = self.yaml_var.get().strip()
+        if not y or not os.path.exists(y):
+            print("[ERROR] Select a dataset YAML first.\n", flush=True)
+            return
+        CleanDialog(self, y, self)
+
+    def oversample_dataset(self):
+        y = self.yaml_var.get().strip()
+        if not y or not os.path.exists(y):
+            print("[ERROR] Select a dataset YAML first.\n", flush=True)
+            return
+        threading.Thread(
+            target=_run_oversample,
+            args=(y, 0.30, self),
+            daemon=True,
+        ).start()
+
+    def _build_styles(self):
+        c = _COLORS
+        s = ttk.Style(self)
+        s.theme_use("clam")
+
+        s.configure("TLabel", background=c["CARD"], foreground=c["FG"], font=("Consolas", 10))
+        s.configure("TEntry", fieldbackground=c["INPUT"], foreground=c["FG"], insertcolor=c["FG"], borderwidth=0)
+        s.configure("TSpinbox", fieldbackground=c["INPUT"], foreground=c["FG"], insertcolor=c["FG"], borderwidth=0)
+        
+        s.configure("TButton", background=c["ACC"], foreground=c["FG"], font=("Consolas", 10, "bold"), borderwidth=0)
+        s.map("TButton", background=[("active", c["HL"])])
+
+        s.configure("Stop.TButton", background="#7a0020", foreground=c["FG"], font=("Consolas", 10, "bold"), borderwidth=0)
+        s.map("Stop.TButton", background=[("active", "#ff002b")])
+
+        s.configure("Resume.TButton", background="#1a4a6a", foreground=c["FG"], font=("Consolas", 10, "bold"), borderwidth=0)
+        s.map("Resume.TButton", background=[("active", "#2d7aaa")])
+
+        s.configure("Fix.TButton", background="#1a4a1a", foreground=c["FG"], font=("Consolas", 10, "bold"), borderwidth=0)
+        s.map("Fix.TButton", background=[("active", "#2d7a2d")])
+
+        s.configure("OS.TButton", background="#2a2a6a", foreground=c["FG"], font=("Consolas", 10, "bold"), borderwidth=0)
+        s.map("OS.TButton", background=[("active", "#4444cc")])
+
+        s.configure("TCheckbutton", background=c["CARD"], foreground=c["FG"], font=("Consolas", 10))
+        s.map("TCheckbutton", background=[("active", c["CARD"])], foreground=[("active", c["HL"])])
+
+        s.configure("TRadiobutton", background=c["CARD"], foreground=c["FG"], font=("Consolas", 10))
+
+        # ── Styled Combobox for Cache selection ──
+        s.configure("TCombobox",
+                    fieldbackground=c["INPUT"], 
+                    background=c["ACC"], 
+                    foreground=c["FG"],
+                    insertcolor=c["FG"], 
+                    borderwidth=0)
+        
+        s.configure("Custom.TCombobox", 
+                    fieldbackground=c["INPUT"], 
+                    foreground=c["FG"], 
+                    background=c["ACC"], 
+                    borderwidth=0)
+        self.option_add("*TCombobox*Listbox.background", c["INPUT"])
+        self.option_add("*TCombobox*Listbox.foreground", c["FG"])
+        self.option_add("*TCombobox*Listbox.selectBackground", c["HL"])
+        self.option_add("*TCombobox*Listbox.selectForeground", c["FG"])
+
+    def _build_ui(self):
+        c = _COLORS
+        top = tk.Frame(self, bg=c["BG"], pady=10)
+        top.pack(fill="x", padx=18)
+        tk.Label(top, text="🔬  MICROPLASTICS TRAINER", bg=c["BG"], fg=c["HL"], font=("Consolas", 14, "bold")).pack(side="left")
+        self.status_lbl = tk.Label(top, text="● Idle", bg=c["BG"], fg="#888", font=("Consolas", 10))
+        self.status_lbl.pack(side="right")
+
+        container = tk.Frame(self, bg=c["BG"])
+        container.pack(fill="both", expand=True, padx=12, pady=12)
+        self._build_controls(container)
+
+    def _build_controls(self, parent: tk.Frame):
+        c = _COLORS
+
+        def card(title: str) -> tk.Frame:
+            tk.Label(parent, text=title, bg=c["BG"], fg=c["HL"], font=("Consolas", 9, "bold")).pack(anchor="w")
+            f = tk.Frame(parent, bg=c["CARD"], padx=10, pady=8)
+            f.pack(fill="x", pady=(2, 8))
+            return f
+
+        def file_row(frm: tk.Frame, label: str, var: tk.StringVar, filetypes: list):
+            r = tk.Frame(frm, bg=c["CARD"])
+            r.pack(fill="x", pady=2)
+            tk.Label(r, text=label, width=12, anchor="w", bg=c["CARD"], fg=c["FG"]).pack(side="left")
+            tk.Entry(r, textvariable=var, bg=c["INPUT"], fg=c["FG"],
+                     insertbackground=c["FG"], relief="flat",
+                     highlightthickness=0).pack(side="left", fill="x", expand=True)
+            ttk.Button(r, text="..", width=3, command=lambda v=var, ft=filetypes: v.set(filedialog.askopenfilename(filetypes=ft))).pack(side="left", padx=2)
+
+        def param_row(frm: tk.Frame, label: str, var, tooltip: str = ""):
+            r = tk.Frame(frm, bg=c["CARD"])
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=label, width=12, anchor="w", bg=c["CARD"], fg=c["FG"]).pack(side="left")
+            if isinstance(var, tk.IntVar):
+                tk.Spinbox(r, textvariable=var, from_=0, to=9999, increment=1,
+                           width=10,
+                           bg=c["INPUT"], fg=c["FG"], insertbackground=c["FG"],
+                           buttonbackground=c["ACC"], relief="flat",
+                           highlightthickness=0).pack(side="left")
+            elif isinstance(var, tk.DoubleVar):
+                tk.Spinbox(r, textvariable=var, from_=0, to=9999, increment=0.001,
+                           width=10,
+                           bg=c["INPUT"], fg=c["FG"], insertbackground=c["FG"],
+                           buttonbackground=c["ACC"], relief="flat",
+                           highlightthickness=0).pack(side="left")
+            else:
+                tk.Entry(r, textvariable=var, width=10,
+                         bg=c["INPUT"], fg=c["FG"], insertbackground=c["FG"],
+                         relief="flat", highlightthickness=0).pack(side="left")
+            if tooltip:
+                tk.Label(r, text=f"  ⓘ {tooltip}", bg=c["CARD"], fg="#666", font=("Consolas", 8)).pack(side="left", padx=(4, 0))
+
+        # ── FILES ──
+        f1 = card("📁  FILES")
+        self.yaml_var  = tk.StringVar()
+        self.model_var = tk.StringVar(value="yolo26n.pt")
+        self.checkpoint_var = tk.StringVar()
+        file_row(f1, "Dataset", self.yaml_var, [("YAML", "*.yaml"), ("All", "*.*")])
+        file_row(f1, "Model", self.model_var, [("Weights", "*.pt"), ("All", "*.*")])
+        file_row(f1, "Checkpoint", self.checkpoint_var, [("Weights", "*.pt"), ("All", "*.*")])
+
+        # ── PARAMETERS ──
+        f2 = card("⚙️  PARAMETERS")
+        self.ep_v   = tk.IntVar(value=EPOCHS)
+        self.im_v   = tk.IntVar(value=IMGSZ)
+        self.ba_v   = tk.IntVar(value=BATCH)
+        self.wo_v   = tk.IntVar(value=4)
+        self.lr0_v  = tk.DoubleVar(value=0.001)
+        self.lrf_v  = tk.DoubleVar(value=0.01)
+        self.wa_v   = tk.IntVar(value=5)
+        self.conf_v = tk.DoubleVar(value=0.25)
+        self.iou_v  = tk.DoubleVar(value=0.45)
+        self.cache_v = tk.StringVar(value="disk")
+
+        param_row(f2, "Epochs",  self.ep_v)
+        param_row(f2, "ImgSz",   self.im_v)
+        param_row(f2, "Batch",   self.ba_v)
+        param_row(f2, "Workers", self.wo_v)
+        param_row(f2, "lr0",     self.lr0_v)
+        param_row(f2, "lrf",     self.lrf_v)
+        param_row(f2, "Warmup",  self.wa_v)
+        param_row(f2, "Conf",    self.conf_v)
+        param_row(f2, "IOU",     self.iou_v, tooltip="NMS overlap threshold (default 0.45).")
+
+        # ── Styled Cache row ──
+        r_cache = tk.Frame(f2, bg=c["CARD"])
+        r_cache.pack(fill="x", pady=1)
+        tk.Label(r_cache, text="Cache", width=12, anchor="w", bg=c["CARD"], fg=c["FG"]).pack(side="left")
+        om = tk.OptionMenu(r_cache, self.cache_v, "none", "ram", "disk")
+        om.config(bg=c["INPUT"], fg=c["FG"], activebackground=c["HL"],
+                  activeforeground=c["FG"], highlightthickness=0,
+                  relief="flat", font=("Consolas", 10), width=7,
+                  indicatoron=True, bd=0)
+        om["menu"].config(bg=c["INPUT"], fg=c["FG"],
+                          activebackground=c["HL"], activeforeground=c["FG"],
+                          font=("Consolas", 10), bd=0)
+        om.pack(side="left")
+
+        # ── LOSS WEIGHTS ──
+        f_loss = card("⚖️  LOSS WEIGHTS")
+        self.cls_v = tk.DoubleVar(value=0.5)
+        self.box_v = tk.DoubleVar(value=7.5)
+        param_row(f_loss, "cls", self.cls_v, tooltip="Class loss gain (default 0.5).")
+        param_row(f_loss, "box", self.box_v, tooltip="Box loss gain (default 7.5).")
+
+        # ── DEVICE ──
+        f3 = card("💻  DEVICE")
+        self.dev_v = tk.StringVar(value=DEVICE)
+        for opt in ("cpu", "cuda", "mps"):
+            tk.Radiobutton(f3, text=opt.upper(), variable=self.dev_v, value=opt, bg=c["CARD"], fg=c["FG"], selectcolor=c["ACC"], activebackground=c["CARD"], font=("Consolas", 10)).pack(side="left", padx=5)
+
+        # ── OPTIONS ──
+        f4 = card("🔁  OPTIONS")
+        self.show_labels_v = tk.BooleanVar(value=True)
+        tk.Checkbutton(f4, text="Show labels on test image", variable=self.show_labels_v,
+                       bg=c["CARD"], fg=c["FG"], selectcolor=c["ACC"],
+                       activebackground=c["CARD"], activeforeground=c["HL"],
+                       font=("Consolas", 10), bd=0, highlightthickness=0).pack(anchor="w")
+
+        # ── Buttons ──
+        r1 = tk.Frame(parent, bg=c["BG"])
+        r1.pack(fill="x", pady=(2, 2))
+        self.train_btn = ttk.Button(r1, text="▶  START TRAINING", command=self.start_training)
+        self.resume_btn = ttk.Button(r1, text="↻  RESUME", style="Resume.TButton", command=self.resume_training)
+        self.stop_btn  = ttk.Button(r1, text="■  STOP", style="Stop.TButton", command=self.stop_training, state="disabled")
+        self.test_btn  = ttk.Button(r1, text="🔍  TEST IMAGE", command=self.run_test_image)
+        self.train_btn.pack(side="left", expand=True, fill="x", padx=(0, 2))
+        self.resume_btn.pack(side="left", expand=True, fill="x", padx=(0, 2))
+        self.stop_btn.pack(side="left",  expand=True, fill="x", padx=(0, 2))
+        self.test_btn.pack(side="left",  expand=True, fill="x")
+
+        r2 = tk.Frame(parent, bg=c["BG"])
+        r2.pack(fill="x", pady=(0, 4))
+        self.fix_btn   = ttk.Button(r2, text="🔧  FIX DATASET", style="Fix.TButton", command=self.fix_dataset)
+        self.clean_btn = ttk.Button(r2, text="🧹  CLEAN DATASET", command=self.open_clean_dialog)
+        self.os_btn    = ttk.Button(r2, text="⚖  OVERSAMPLE", style="OS.TButton", command=self.oversample_dataset)
+        self.fix_btn.pack(side="left", expand=True, fill="x", padx=(0, 2))
+        self.clean_btn.pack(side="left", expand=True, fill="x", padx=(0, 2))
+        self.os_btn.pack(side="left", expand=True, fill="x")
+
 
 if __name__ == "__main__":
     app = TrainerApp()

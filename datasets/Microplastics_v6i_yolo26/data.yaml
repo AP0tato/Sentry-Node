@@ -1,0 +1,23 @@
+names:
+- Air bubble
+- Background material
+- Cellulose filter fibre
+- Cotton
+- Diatom
+- Edge of slide
+- Fragment
+- Glass filter fibre
+- Hair
+- Hair textile
+- Microfibre
+- Pen
+nc: 12
+roboflow:
+  license: CC BY 4.0
+  project: microplastics-t0ddd
+  url: https://universe.roboflow.com/uni-oahuo/microplastics-t0ddd/dataset/6
+  version: 6
+  workspace: uni-oahuo
+test: ../test/images
+train: ../train/images
+val: ../valid/images
