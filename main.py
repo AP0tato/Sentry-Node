@@ -5,6 +5,7 @@ GUI front-end for training YOLO models on microplastics datasets.
 """
 
 import atexit
+import gc
 import glob
 import os
 import shutil
@@ -390,6 +391,16 @@ def _run_training(yaml_path: str, model_path: str,
             print(f"\n[ERROR] Training failed: {exc}\n", flush=True)
             app.set_status("Error — see log", "red")
     finally:
+        try:
+            del model
+        except Exception:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         _resume_flag = False
         app.training_finished()
 
@@ -399,12 +410,12 @@ def _run_training(yaml_path: str, model_path: str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_test_image(app: "TrainerApp", conf: float = 0.25, iou: float = 0.45,
-                    auto: bool = False) -> None:
+                    auto: bool = False, test_img_path: str = "") -> None:
     try:
         if not auto:
             app.set_status("Running inference…", "yellow")
 
-        test_img = os.path.join(os.getcwd(), "test_image.jpg")
+        test_img = test_img_path or os.path.join(os.getcwd(), "test_image.jpg")
         if not os.path.exists(test_img):
             print("[ERROR] test_image.jpg not found in the current directory.\n", flush=True)
             if not auto:
@@ -650,9 +661,15 @@ class TrainerApp(tk.Tk):
         self.set_status("Stopping…", "orange")
 
     def run_test_image(self):
+        image_path = filedialog.askopenfilename(
+            title="Select test image",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff"), ("All", "*.*")],
+        )
+        if not image_path:
+            return
         threading.Thread(
             target=_run_test_image,
-            args=(self, float(self.conf_v.get()), float(self.iou_v.get())),
+            args=(self, float(self.conf_v.get()), float(self.iou_v.get()), False, image_path),
             daemon=True,
         ).start()
 

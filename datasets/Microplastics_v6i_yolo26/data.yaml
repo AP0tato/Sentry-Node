@@ -1,9 +1,11 @@
 names:
 - Air bubble
+- Anthropogenic
 - Background material
 - Cellulose filter fibre
 - Cotton
 - Diatom
+- Easylift tab
 - Edge of slide
 - Fragment
 - Glass filter fibre
@@ -11,7 +13,7 @@ names:
 - Hair textile
 - Microfibre
 - Pen
-nc: 12
+nc: 14
 roboflow:
   license: CC BY 4.0
   project: microplastics-t0ddd
